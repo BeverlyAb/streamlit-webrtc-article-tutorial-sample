@@ -2,9 +2,13 @@ import streamlit as st
 from streamlit_webrtc import webrtc_streamer
 import av
 import cv2
-
-
-st.title("KAPI")
+import queue
+import numpy as np
+from download import download_file
+from pathlib import Path
+from typing import List, NamedTuple
+import logging
+import threading
 
 from streamlit_webrtc import (
     AudioProcessorBase,
@@ -14,34 +18,170 @@ from streamlit_webrtc import (
     webrtc_streamer,
 )
 
+st.title("KAPI")
+HERE = Path(__file__).parent
+
 RTC_CONFIGURATION = RTCConfiguration(
     {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
 )
-class VideoProcessor:
-    def __init__(self) -> None:
-        self.threshold1 = 100
-        self.threshold2 = 200
+logger = logging.getLogger(__name__)
+def app_object_detection():
+    """Object detection demo with MobileNet SSD.
+    This model and code are based on
+    https://github.com/robmarkcole/object-detection-app
+    """
+    MODEL_URL = "https://github.com/robmarkcole/object-detection-app/raw/master/model/MobileNetSSD_deploy.caffemodel"  # noqa: E501
+    MODEL_LOCAL_PATH = HERE / "./models/MobileNetSSD_deploy.caffemodel"
+    PROTOTXT_URL = "https://github.com/robmarkcole/object-detection-app/raw/master/model/MobileNetSSD_deploy.prototxt.txt"  # noqa: E501
+    PROTOTXT_LOCAL_PATH = HERE / "./models/MobileNetSSD_deploy.prototxt.txt"
 
-    def recv(self, frame):
-        img = frame.to_ndarray(format="bgr24")
+    CLASSES = [
+        "background",
+        "aeroplane",
+        "bicycle",
+        "bird",
+        "boat",
+        "bottle",
+        "bus",
+        "car",
+        "cat",
+        "chair",
+        "cow",
+        "diningtable",
+        "dog",
+        "horse",
+        "motorbike",
+        "person",
+        "pottedplant",
+        "sheep",
+        "sofa",
+        "train",
+        "tvmonitor",
+    ]
+    COLORS = np.random.uniform(0, 255, size=(len(CLASSES), 3))
 
-        img = cv2.cvtColor(cv2.Canny(img, self.threshold1, self.threshold2), cv2.COLOR_GRAY2BGR)
+    download_file(MODEL_URL, MODEL_LOCAL_PATH, expected_size=23147564)
+    download_file(PROTOTXT_URL, PROTOTXT_LOCAL_PATH, expected_size=29353)
 
-        return av.VideoFrame.from_ndarray(img, format="bgr24")
+    DEFAULT_CONFIDENCE_THRESHOLD = 0.5
 
+    class Detection(NamedTuple):
+        name: str
+        prob: float
 
-webrtc_ctx = webrtc_streamer(
-    key="object-detection",
-    mode=WebRtcMode.SENDRECV,
-    rtc_configuration=RTC_CONFIGURATION,
-    # video_processor_factory=MobileNetSSDVideoProcessor,
-    media_stream_constraints={"video": True, "audio": False},
-    async_processing=True,
-)
+    class MobileNetSSDVideoProcessor(VideoProcessorBase):
+        confidence_threshold: float
+        result_queue: "queue.Queue[List[Detection]]"
 
-# if ctx.video_processor:
-#     ctx.video_processor.threshold1 = st.slider("Threshold1", min_value=0, max_value=1000, step=1, value=100)
-#     ctx.video_processor.threshold2 = st.slider("Threshold2", min_value=0, max_value=1000, step=1, value=200)
+        def __init__(self) -> None:
+            self._net = cv2.dnn.readNetFromCaffe(
+                str(PROTOTXT_LOCAL_PATH), str(MODEL_LOCAL_PATH)
+            )
+            self.confidence_threshold = DEFAULT_CONFIDENCE_THRESHOLD
+            self.result_queue = queue.Queue()
 
+        def _annotate_image(self, image, detections):
+            # loop over the detections
+            (h, w) = image.shape[:2]
+            result: List[Detection] = []
+            for i in np.arange(0, detections.shape[2]):
+                confidence = detections[0, 0, i, 2]
 
+                if confidence > self.confidence_threshold:
+                    # extract the index of the class label from the `detections`,
+                    # then compute the (x, y)-coordinates of the bounding box for
+                    # the object
+                    idx = int(detections[0, 0, i, 1])
+                    box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
+                    (startX, startY, endX, endY) = box.astype("int")
+
+                    name = CLASSES[idx]
+                    result.append(Detection(name=name, prob=float(confidence)))
+
+                    # display the prediction
+                    label = f"{name}: {round(confidence * 100, 2)}%"
+                    cv2.rectangle(image, (startX, startY), (endX, endY), COLORS[idx], 2)
+                    y = startY - 15 if startY - 15 > 15 else startY + 15
+                    cv2.putText(
+                        image,
+                        label,
+                        (startX, y),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5,
+                        COLORS[idx],
+                        2,
+                    )
+            return image, result
+
+        def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
+            image = frame.to_ndarray(format="bgr24")
+            blob = cv2.dnn.blobFromImage(
+                cv2.resize(image, (300, 300)), 0.007843, (300, 300), 127.5
+            )
+            self._net.setInput(blob)
+            detections = self._net.forward()
+            annotated_image, result = self._annotate_image(image, detections)
+
+            # NOTE: This `recv` method is called in another thread,
+            # so it must be thread-safe.
+            self.result_queue.put(result)
+
+            return av.VideoFrame.from_ndarray(annotated_image, format="bgr24")
+
+    webrtc_ctx = webrtc_streamer(
+        key="object-detection",
+        mode=WebRtcMode.SENDRECV,
+        rtc_configuration=RTC_CONFIGURATION,
+        video_processor_factory=MobileNetSSDVideoProcessor,
+        media_stream_constraints={"video": True, "audio": False},
+        async_processing=True,
+    )
+
+    confidence_threshold = st.slider(
+        "Confidence threshold", 0.0, 1.0, DEFAULT_CONFIDENCE_THRESHOLD, 0.05
+    )
+    if webrtc_ctx.video_processor:
+        webrtc_ctx.video_processor.confidence_threshold = confidence_threshold
+
+    if st.checkbox("Show the detected labels", value=True):
+        if webrtc_ctx.state.playing:
+            labels_placeholder = st.empty()
+            # NOTE: The video transformation with object detection and
+            # this loop displaying the result labels are running
+            # in different threads asynchronously.
+            # Then the rendered video frames and the labels displayed here
+            # are not strictly synchronized.
+            while True:
+                if webrtc_ctx.video_processor:
+                    try:
+                        result = webrtc_ctx.video_processor.result_queue.get(
+                            timeout=1.0
+                        )
+                    except queue.Empty:
+                        result = None
+                    labels_placeholder.table(result)
+                else:
+                    break
+
+def main():
+
+    object_detection_page = "Real time object detection (sendrecv)"
+
+    app_mode = st.sidebar.selectbox(
+        "Choose the app mode",
+        [
+            object_detection_page,
+        ],
+    )
+    st.subheader(app_mode)
+    app_mode = object_detection_page
+    if app_mode == object_detection_page:
+        app_object_detection()
+
+    logger.debug("=== Alive threads ===")
+    for thread in threading.enumerate():
+        if thread.is_alive():
+            logger.debug(f"  {thread.name} ({thread.ident})")
+
+main()
 
