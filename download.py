@@ -2,8 +2,6 @@ import pathlib as Path
 import streamlit as st
 import urllib.request
 
-
-
 def download_file(url, download_to: Path, expected_size=None):
     # Don't download the file twice.
     # (If possible, verify the download using the file length.)
